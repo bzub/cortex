@@ -371,24 +371,15 @@ func (c *seriesStore) PutOne(ctx context.Context, from, through model.Time, chun
 // calculateIndexEntries creates a set of batched WriteRequests for all the chunks it is given.
 func (c *seriesStore) calculateIndexEntries(from, through model.Time, chunk Chunk) (WriteBatch, []string, error) {
 	seenIndexEntries := map[string]struct{}{}
-	entries := []IndexEntry{}
-	keysToCache := []string{}
 
 	metricName := chunk.Metric.Get(labels.MetricName)
 	if metricName == "" {
 		return nil, nil, fmt.Errorf("no MetricNameLabel for chunk")
 	}
-	keys := c.schema.GetLabelEntryCacheKeys(from, through, chunk.UserID, chunk.Metric)
 
-	_, _, missing := c.writeDedupeCache.Fetch(context.Background(), keys)
-	if len(missing) != 0 {
-		labelEntries, err := c.schema.GetLabelWriteEntries(from, through, chunk.UserID, metricName, chunk.Metric, chunk.ExternalKey())
-		if err != nil {
-			return nil, nil, err
-		}
-
-		entries = append(entries, labelEntries...)
-		keysToCache = missing
+	entries, keysToCache, err := c.schema.GetLabelWriteEntries(c.writeDedupeCache, from, through, chunk.UserID, metricName, chunk.Metric, chunk.ExternalKey())
+	if err != nil {
+		return nil, nil, err
 	}
 
 	chunkEntries, err := c.schema.GetChunkWriteEntries(from, through, chunk.UserID, metricName, chunk.Metric, chunk.ExternalKey())

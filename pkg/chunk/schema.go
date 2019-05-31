@@ -1,6 +1,7 @@
 package chunk
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -9,6 +10,8 @@ import (
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
+
+	"github.com/cortexproject/cortex/pkg/chunk/cache"
 )
 
 var (
@@ -34,9 +37,8 @@ type Schema interface {
 	GetWriteEntries(from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, error)
 
 	// Should only be used with the seriesStore. TODO: Make seriesStore implement a different interface altogether.
-	GetLabelWriteEntries(from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, error)
+	GetLabelWriteEntries(cache cache.Cache, from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, []string, error)
 	GetChunkWriteEntries(from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, error)
-	GetLabelEntryCacheKeys(from, through model.Time, userID string, labels labels.Labels) []string
 
 	// When doing a read, use these methods to return the list of entries you should query
 	GetReadQueriesForMetric(from, through model.Time, userID string, metricName string) ([]IndexQuery, error)
@@ -97,17 +99,25 @@ func (s schema) GetWriteEntries(from, through model.Time, userID string, metricN
 	return result, nil
 }
 
-func (s schema) GetLabelWriteEntries(from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, error) {
+func (s schema) GetLabelWriteEntries(cache cache.Cache, from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, []string, error) {
 	var result []IndexEntry
+	var keysToCache []string
 
 	for _, bucket := range s.buckets(from, through, userID) {
+		key := s.getLabelEntryCacheKey(bucket, userID, labels)
+		_, _, missing := cache.Fetch(context.Background(), []string{key})
+		if len(missing) == 0 {
+			continue
+		}
+
 		entries, err := s.entries.GetLabelWriteEntries(bucket, metricName, labels, chunkID)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		result = append(result, entries...)
+		keysToCache = append(keysToCache, missing...)
 	}
-	return result, nil
+	return result, keysToCache, nil
 }
 
 func (s schema) GetChunkWriteEntries(from, through model.Time, userID string, metricName string, labels labels.Labels, chunkID string) ([]IndexEntry, error) {
@@ -125,24 +135,19 @@ func (s schema) GetChunkWriteEntries(from, through model.Time, userID string, me
 }
 
 // Should only used for v9Schema
-func (s schema) GetLabelEntryCacheKeys(from, through model.Time, userID string, labels labels.Labels) []string {
-	var result []string
-	for _, bucket := range s.buckets(from, through, userID) {
-		key := strings.Join([]string{
-			bucket.tableName,
-			bucket.hashKey,
-			string(sha256bytes(labels.String())),
-		},
-			"-",
-		)
-		// This is just encoding to remove invalid characters so that we can put them in memcache.
-		// We're not hashing them as the length of the key is well within memcache bounds. tableName + userid + day + 32Byte(seriesID)
-		key = hex.EncodeToString([]byte(key))
+func (s schema) getLabelEntryCacheKey(bucket Bucket, userID string, labels labels.Labels) string {
+	key := strings.Join([]string{
+		bucket.tableName,
+		bucket.hashKey,
+		string(sha256bytes(labels.String())),
+	},
+		"-",
+	)
+	// This is just encoding to remove invalid characters so that we can put them in memcache.
+	// We're not hashing them as the length of the key is well within memcache bounds. tableName + userid + day + 32Byte(seriesID)
+	key = hex.EncodeToString([]byte(key))
 
-		result = append(result, key)
-	}
-
-	return result
+	return key
 }
 
 func (s schema) GetReadQueriesForMetric(from, through model.Time, userID string, metricName string) ([]IndexQuery, error) {
